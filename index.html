@@ -433,85 +433,110 @@ async function claudeBackend(db){
     saveNames:names=>namesDoc.set({names})
   };
 }
-// 2) Standalone hosting (GitHub Pages): ntfy.sh topic as a shared event log.
-//    Each save is one small event; everyone replays the log in order, so two
-//    people saving different matches at once never overwrite each other.
+// 2) Standalone hosting (GitHub Pages): a shared event log on three public ntfy
+//    servers at once. Each save is one small event sent to all of them; a save
+//    counts when any server accepts it, and every phone merges the logs of all
+//    servers, so one blocked or slow server never loses a result.
+const SERVERS=["https://ntfy.sh","https://ntfy.envs.net","https://ntfy.adminforge.de"];
 function ntfyBackend(topic){
-  const BASE="https://ntfy.sh/"+topic;
   const CACHE_KEY="americana-cache-"+topic;
-  const seen=new Map(); // ntfy id -> {time,seq,ev}
-  let seq=0, es=null, lastOk=0;
+  const events=new Map(); // nonce -> event
+  const pending={};        // matches being saved right now: keep them on screen
+  const lastOk={};
   function load(){try{return JSON.parse(localStorage.getItem(CACHE_KEY)||"null")}catch(e){return null}}
-  function store(){try{localStorage.setItem(CACHE_KEY,JSON.stringify({names:state.names,results:state.results}))}catch(e){}}
-  function ingest(msg){
-    if(!msg||msg.event!=="message"||!msg.id||seen.has(msg.id))return false;
-    let ev;try{ev=JSON.parse(msg.message)}catch(e){return false}
-    seen.set(msg.id,{time:Number(msg.time)||0,seq:seq++,ev});return true;
+  function store(){try{localStorage.setItem(CACHE_KEY,JSON.stringify({names:state.names,results:state.results,events:[...events.values()]}))}catch(e){}}
+  function live(){
+    const now=Date.now(),up=SERVERS.filter(s=>now-(lastOk[s]||0)<40000).length;
+    if(up)setLive("on","En directo");else setLive("err","Sin conexión");
+  }
+  function add(ev){
+    if(!ev||typeof ev!=="object"||!ev.n||!ev.k||events.has(ev.n))return false;
+    events.set(ev.n,ev);return true;
+  }
+  function addMsg(msg){
+    if(!msg||msg.event!=="message")return false;
+    try{return add(JSON.parse(msg.message))}catch(e){return false}
   }
   function rebuild(){
-    const list=[...seen.values()].sort((x,y)=>x.time-y.time||(x.ev.c||0)-(y.ev.c||0)||x.seq-y.seq);
-    if(!list.length)return;
+    const list=[...events.values()].sort((x,y)=>(x.c||0)-(y.c||0)||String(x.n).localeCompare(String(y.n)));
     let names=DEFAULT_NAMES.slice(),results={};
-    list.forEach(({ev})=>{
+    list.forEach(ev=>{
       if(ev.k==="s"){ if(Array.isArray(ev.names)&&ev.names.length===8)names=ev.names.slice(); results=Object.assign({},ev.results||{}); }
       else if(ev.k==="r"&&/^m\d{1,2}$/.test(ev.id)){ if(ev.v&&validResult(ev.v))results[ev.id]={a:ev.v.a,b:ev.v.b}; else delete results[ev.id]; }
       else if(ev.k==="n"&&Array.isArray(ev.names)&&ev.names.length===8){ names=ev.names.slice(); }
     });
     state.names=names.map((x,i)=>String(x||DEFAULT_NAMES[i]).slice(0,18));
-    const clean={};Object.keys(results).forEach(k=>{if(validResult(results[k]))clean[k]=results[k]});
+    const clean={};Object.keys(results).forEach(k=>{if(validResult(results[k]))clean[k]={a:results[k].a,b:results[k].b}});
+    Object.keys(pending).forEach(k=>{if(pending[k])clean[k]=pending[k];else delete clean[k];});
     state.results=clean;store();render();
   }
-  // Events are idempotent (same event twice = same state), so trying several
-  // delivery routes in a row is safe.
-  async function publish(ev){
-    ev.c=Date.now(); ev.n=Math.random().toString(36).slice(2,10);
-    const body=JSON.stringify(ev);
-    const got=()=>[...seen.values()].some(x=>x.ev&&x.ev.n===ev.n);
-    const take=async r=>{const msg=await r.json().catch(()=>null);if(msg&&ingest(msg))rebuild();};
-    let why="";
-    // 1) normal POST
-    try{const r=await fetch(BASE,{method:"POST",body});if(r.ok){await take(r);return;}why="HTTP "+r.status;}catch(e){why=e&&e.message||"red";}
-    await history(); if(got())return;
-    // 2) GET publish
-    const getUrl=BASE+"/publish?message="+encodeURIComponent(body);
-    try{const r=await fetch(getUrl,{cache:"no-store"});if(r.ok){await take(r);return;}why+=" / HTTP "+r.status;}catch(e){why+=" / "+(e&&e.message||"red");}
-    // 3) plain request without CORS, then confirm by reading the log
-    try{fetch(getUrl+"&_="+Date.now(),{mode:"no-cors",cache:"no-store"}).catch(()=>{});}catch(e){}
-    try{const img=new Image();img.src=getUrl+"&i="+Date.now();}catch(e){}
-    for(let i=0;i<6;i++){await new Promise(r=>setTimeout(r,1000));await history();if(got())return;}
-    throw new Error(why||"sin respuesta");
+  function timed(url,opt,ms){
+    const ac=new AbortController();const t=setTimeout(()=>ac.abort(),ms||8000);
+    return fetch(url,Object.assign({signal:ac.signal,cache:"no-store"},opt||{})).finally(()=>clearTimeout(t));
+  }
+  async function historyFrom(s){
+    const r=await timed(s+"/"+topic+"/json?poll=1&since=all");
+    if(!r.ok)throw new Error("HTTP "+r.status);
+    const txt=await r.text();let changed=false;
+    txt.split("\n").forEach(l=>{if(!l.trim())return;try{if(addMsg(JSON.parse(l)))changed=true}catch(e){}});
+    lastOk[s]=Date.now();return changed;
   }
   async function history(){
-    try{
-      const r=await fetch(BASE+"/json?poll=1&since=all",{cache:"no-store"});
-      if(!r.ok)throw new Error(r.status);
-      const txt=await r.text();let changed=false,count=0;
-      txt.split("\n").forEach(l=>{if(!l.trim())return;try{const m=JSON.parse(l);if(m.event==="message")count++;if(ingest(m))changed=true}catch(e){}});
-      lastOk=Date.now();setLive("on","En directo");
-      if(changed)rebuild();
-      // log expired on the server but this phone still remembers the tournament: put it back
-      if(count===0&&!seen.size){const c=load();if(c&&(Object.keys(c.results||{}).length||JSON.stringify(c.names)!==JSON.stringify(DEFAULT_NAMES))){publish({k:"s",names:c.names,results:c.results}).catch(()=>{});}}
-      return true;
-    }catch(e){if(Date.now()-lastOk>15000)setLive("err","Sin conexión");return false;}
+    const res=await Promise.allSettled(SERVERS.map(historyFrom));
+    live();
+    if(res.some(r=>r.status==="fulfilled"&&r.value))rebuild();
+    return res.some(r=>r.status==="fulfilled");
   }
-  function stream(){
+  async function sendTo(s,body){
+    const base=s+"/"+topic;
+    try{const r=await timed(base,{method:"POST",body});if(r.ok){lastOk[s]=Date.now();return true;}}catch(e){}
+    try{const r=await timed(base+"/publish?message="+encodeURIComponent(body));if(r.ok){lastOk[s]=Date.now();return true;}}catch(e){}
+    // last resort: request without CORS (answer unreadable, checked through the log)
+    try{await timed(base+"/publish?message="+encodeURIComponent(body)+"&_="+Date.now(),{mode:"no-cors"});}catch(e){}
+    throw new Error("no");
+  }
+  async function publish(ev){
+    ev.c=Date.now(); ev.n=Date.now().toString(36)+Math.random().toString(36).slice(2,8);
+    const body=JSON.stringify(ev);
+    const sends=SERVERS.map(s=>sendTo(s,body));
+    let ok=false;
+    try{await Promise.any(sends);ok=true;}catch(e){}
+    if(!ok){ // maybe it landed without a readable answer: confirm in the logs
+      for(let i=0;i<3&&!ok;i++){await history();ok=events.has(ev.n);if(!ok)await new Promise(r=>setTimeout(r,800));}
+    }
+    if(!ok){live();throw new Error("ningún servidor responde");}
+    add(ev);rebuild();live();
+  }
+  const streams={};
+  function stream(s){
     try{
-      if(es)es.close();
-      es=new EventSource(BASE+"/sse");
-      es.onmessage=e=>{try{if(ingest(JSON.parse(e.data)))rebuild()}catch(x){}lastOk=Date.now();setLive("on","En directo")};
-      es.onopen=()=>{lastOk=Date.now();setLive("on","En directo")};
+      if(streams[s]&&streams[s].readyState!==2)return;
+      const es=new EventSource(s+"/"+topic+"/sse");streams[s]=es;
+      es.onopen=()=>{lastOk[s]=Date.now();live();};
+      es.onmessage=e=>{lastOk[s]=Date.now();try{if(addMsg(JSON.parse(e.data)))rebuild()}catch(x){}live();};
+      es.addEventListener("keepalive",()=>{lastOk[s]=Date.now();});
+      es.onerror=()=>{es.close();setTimeout(()=>stream(s),10000);};
     }catch(e){}
   }
-  const c=load();if(c){if(Array.isArray(c.names)&&c.names.length===8)state.names=c.names;state.results=c.results||{};render();}
-  history().then(()=>{state.ready=true;render();});
-  stream();
+  // start from what this phone already knows, then merge the servers
+  const c=load();
+  if(c){(c.events||[]).forEach(add);if(events.size)rebuild();else{if(Array.isArray(c.names)&&c.names.length===8)state.names=c.names;state.results=c.results||{};render();}}
+  history().then(()=>{
+    state.ready=true;render();
+    // servers keep messages ~12 h: if the logs are empty or old, put the current state back
+    const newest=Math.max(0,...[...events.values()].map(e=>e.c||0));
+    const hasData=Object.keys(state.results).length||JSON.stringify(state.names)!==JSON.stringify(DEFAULT_NAMES);
+    if(hasData&&Date.now()-newest>6*3600*1000)publish({k:"s",names:state.names.slice(),results:Object.assign({},state.results)}).catch(()=>{});
+  });
+  SERVERS.forEach(stream);
   setInterval(history,15000);
-  document.addEventListener("visibilitychange",()=>{if(!document.hidden){history();if(!es||es.readyState===2)stream();}});
+  setInterval(live,10000);
+  document.addEventListener("visibilitychange",()=>{if(!document.hidden){history();SERVERS.forEach(stream);}});
   const link=location.origin+location.pathname;
   const wa="https://wa.me/?text="+encodeURIComponent("Americana de pádel 🎾 Resultados y clasificación aquí: "+link);
   $("#notice").innerHTML=`<div class="notice" style="display:flex;gap:10px;align-items:center;justify-content:space-between"><span><strong>Comparte el enlace</strong><br>Todos ven y apuntan los mismos resultados.</span><a class="btn primary" style="flex:0 0 auto;padding:0 16px;text-decoration:none" href="${wa}" target="_blank" rel="noopener">WhatsApp</a></div>`;
   return {
-    saveResult:(mid,val)=>publish({k:"r",id:mid,v:val}),
+    saveResult:async(mid,val)=>{pending[mid]=val;try{await publish({k:"r",id:mid,v:val});}finally{delete pending[mid];}},
     saveNames:names=>publish({k:"n",names})
   };
 }
