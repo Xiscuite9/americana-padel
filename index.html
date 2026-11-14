@@ -403,7 +403,7 @@ async function commitName(i,v){
 function handleWriteError(err){
   const code=err&&err.code;
   if(code==="invalid_argument"||code==="not_granted"){state.readOnly=true;render();toast("No tienes permiso para guardar en esta página");}
-  else toast("No se pudo guardar. Revisa la conexión y prueba otra vez");
+  else toast("No se pudo guardar ("+(err&&err.message||"error")+"). Prueba otra vez");
 }
 
 /* ---------- backends ---------- */
@@ -461,12 +461,25 @@ function ntfyBackend(topic){
     const clean={};Object.keys(results).forEach(k=>{if(validResult(results[k]))clean[k]=results[k]});
     state.results=clean;store();render();
   }
+  // Events are idempotent (same event twice = same state), so trying several
+  // delivery routes in a row is safe.
   async function publish(ev){
-    ev.c=Date.now();
-    const r=await fetch(BASE,{method:"POST",body:JSON.stringify(ev)});
-    if(!r.ok)throw new Error(r.status);
-    const msg=await r.json().catch(()=>null);
-    if(msg&&ingest(msg))rebuild();
+    ev.c=Date.now(); ev.n=Math.random().toString(36).slice(2,10);
+    const body=JSON.stringify(ev);
+    const got=()=>[...seen.values()].some(x=>x.ev&&x.ev.n===ev.n);
+    const take=async r=>{const msg=await r.json().catch(()=>null);if(msg&&ingest(msg))rebuild();};
+    let why="";
+    // 1) normal POST
+    try{const r=await fetch(BASE,{method:"POST",body});if(r.ok){await take(r);return;}why="HTTP "+r.status;}catch(e){why=e&&e.message||"red";}
+    await history(); if(got())return;
+    // 2) GET publish
+    const getUrl=BASE+"/publish?message="+encodeURIComponent(body);
+    try{const r=await fetch(getUrl,{cache:"no-store"});if(r.ok){await take(r);return;}why+=" / HTTP "+r.status;}catch(e){why+=" / "+(e&&e.message||"red");}
+    // 3) plain request without CORS, then confirm by reading the log
+    try{fetch(getUrl+"&_="+Date.now(),{mode:"no-cors",cache:"no-store"}).catch(()=>{});}catch(e){}
+    try{const img=new Image();img.src=getUrl+"&i="+Date.now();}catch(e){}
+    for(let i=0;i<6;i++){await new Promise(r=>setTimeout(r,1000));await history();if(got())return;}
+    throw new Error(why||"sin respuesta");
   }
   async function history(){
     try{
@@ -493,7 +506,7 @@ function ntfyBackend(topic){
   history().then(()=>{state.ready=true;render();});
   stream();
   setInterval(history,15000);
-  document.addEventListener("visibilitychange",()=>{if(!document.hidden){history();stream();}});
+  document.addEventListener("visibilitychange",()=>{if(!document.hidden){history();if(!es||es.readyState===2)stream();}});
   const link=location.origin+location.pathname;
   const wa="https://wa.me/?text="+encodeURIComponent("Americana de pádel 🎾 Resultados y clasificación aquí: "+link);
   $("#notice").innerHTML=`<div class="notice" style="display:flex;gap:10px;align-items:center;justify-content:space-between"><span><strong>Comparte el enlace</strong><br>Todos ven y apuntan los mismos resultados.</span><a class="btn primary" style="flex:0 0 auto;padding:0 16px;text-decoration:none" href="${wa}" target="_blank" rel="noopener">WhatsApp</a></div>`;
