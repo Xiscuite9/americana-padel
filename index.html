@@ -433,69 +433,87 @@ async function claudeBackend(db){
     saveNames:names=>namesDoc.set({names})
   };
 }
-// 2) Standalone hosting: free JSON store, polled every 3 s
-function blobBackend(id){
-  const URL_="https://jsonblob.com/api/jsonBlob/"+encodeURIComponent(id);
-  let busy=false;
-  async function pull(){
-    if(busy)return;
-    try{
-      const r=await fetch(URL_,{cache:"no-store"});if(!r.ok)throw new Error(r.status);
-      apply(await r.json());setLive("on","En directo");
-    }catch(e){setLive("err","Sin conexión");}
+// 2) Standalone hosting (GitHub Pages): ntfy.sh topic as a shared event log.
+//    Each save is one small event; everyone replays the log in order, so two
+//    people saving different matches at once never overwrite each other.
+function ntfyBackend(topic){
+  const BASE="https://ntfy.sh/"+topic;
+  const CACHE_KEY="americana-cache-"+topic;
+  const seen=new Map(); // ntfy id -> {time,seq,ev}
+  let seq=0, es=null, lastOk=0;
+  function load(){try{return JSON.parse(localStorage.getItem(CACHE_KEY)||"null")}catch(e){return null}}
+  function store(){try{localStorage.setItem(CACHE_KEY,JSON.stringify({names:state.names,results:state.results}))}catch(e){}}
+  function ingest(msg){
+    if(!msg||msg.event!=="message"||!msg.id||seen.has(msg.id))return false;
+    let ev;try{ev=JSON.parse(msg.message)}catch(e){return false}
+    seen.set(msg.id,{time:Number(msg.time)||0,seq:seq++,ev});return true;
   }
-  function apply(d){
-    if(d&&Array.isArray(d.names)&&d.names.length===8)state.names=d.names.map((x,i)=>String(x||DEFAULT_NAMES[i]).slice(0,18));
-    const res={};if(d&&d.results)Object.keys(d.results).forEach(k=>{const x=d.results[k];if(validResult(x))res[k]={a:x.a,b:x.b}});
-    state.results=res;state.ready=true;render();
+  function rebuild(){
+    const list=[...seen.values()].sort((x,y)=>x.time-y.time||(x.ev.c||0)-(y.ev.c||0)||x.seq-y.seq);
+    if(!list.length)return;
+    let names=DEFAULT_NAMES.slice(),results={};
+    list.forEach(({ev})=>{
+      if(ev.k==="s"){ if(Array.isArray(ev.names)&&ev.names.length===8)names=ev.names.slice(); results=Object.assign({},ev.results||{}); }
+      else if(ev.k==="r"&&/^m\d{1,2}$/.test(ev.id)){ if(ev.v&&validResult(ev.v))results[ev.id]={a:ev.v.a,b:ev.v.b}; else delete results[ev.id]; }
+      else if(ev.k==="n"&&Array.isArray(ev.names)&&ev.names.length===8){ names=ev.names.slice(); }
+    });
+    state.names=names.map((x,i)=>String(x||DEFAULT_NAMES[i]).slice(0,18));
+    const clean={};Object.keys(results).forEach(k=>{if(validResult(results[k]))clean[k]=results[k]});
+    state.results=clean;store();render();
   }
-  async function mutate(fn){
-    busy=true;
-    try{
-      const r=await fetch(URL_,{cache:"no-store"});const d=r.ok?await r.json():{};
-      d.names=Array.isArray(d.names)?d.names:DEFAULT_NAMES.slice();d.results=d.results||{};
-      fn(d);
-      const w=await fetch(URL_,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(d)});
-      if(!w.ok)throw new Error(w.status);
-      apply(d);
-    }finally{busy=false;}
+  async function publish(ev){
+    ev.c=Date.now();
+    const r=await fetch(BASE,{method:"POST",body:JSON.stringify(ev)});
+    if(!r.ok)throw new Error(r.status);
+    const msg=await r.json().catch(()=>null);
+    if(msg&&ingest(msg))rebuild();
   }
-  const link=location.origin+location.pathname+"?t="+encodeURIComponent(id);
-  const wa="https://wa.me/?text="+encodeURIComponent("Americana de pádel: apunta aquí los resultados 🎾 "+link);
-  $("#notice").innerHTML=`<div class="notice" style="display:flex;gap:8px;align-items:center;justify-content:space-between"><span><strong>Enlace del torneo</strong><br>Pásalo a los 8 jugadores.</span><a class="btn primary" style="flex:0 0 auto;padding:0 14px;text-decoration:none" href="${wa}" target="_blank" rel="noopener">WhatsApp</a></div>`;
-  pull();setInterval(pull,3000);
-  document.addEventListener("visibilitychange",()=>{if(!document.hidden)pull()});
-  return {
-    saveResult:(mid,val)=>mutate(d=>{if(val)d.results[mid]=val;else delete d.results[mid];}),
-    saveNames:names=>mutate(d=>{d.names=names;})
-  };
-}
-function setupScreen(){
-  $("#notice").innerHTML=`<div class="setup"><h2>Crear torneo</h2><p>Solo lo hace el organizador, una vez. Se crea el marcador compartido y aparece un botón para enviar el enlace por WhatsApp. Si te han pasado un enlace, ábrelo tal cual y no crees otro torneo.</p><button class="btn primary" id="create">Crear torneo</button></div>`;
-  $("#create").onclick=async()=>{
+  async function history(){
     try{
-      const r=await fetch("https://jsonblob.com/api/jsonBlob",{method:"POST",headers:{"Content-Type":"application/json","Accept":"application/json"},body:JSON.stringify({names:DEFAULT_NAMES,results:{}})});
+      const r=await fetch(BASE+"/json?poll=1&since=all",{cache:"no-store"});
       if(!r.ok)throw new Error(r.status);
-      const loc=r.headers.get("Location")||r.headers.get("x-jsonblob-id")||r.headers.get("X-jsonblob")||"";
-      const id=loc.split("/").pop();
-      if(!id)throw new Error("sin id");
-      location.search="?t="+id;
-    }catch(e){toast("No se pudo crear. Prueba otra vez");}
+      const txt=await r.text();let changed=false,count=0;
+      txt.split("\n").forEach(l=>{if(!l.trim())return;try{const m=JSON.parse(l);if(m.event==="message")count++;if(ingest(m))changed=true}catch(e){}});
+      lastOk=Date.now();setLive("on","En directo");
+      if(changed)rebuild();
+      // log expired on the server but this phone still remembers the tournament: put it back
+      if(count===0&&!seen.size){const c=load();if(c&&(Object.keys(c.results||{}).length||JSON.stringify(c.names)!==JSON.stringify(DEFAULT_NAMES))){publish({k:"s",names:c.names,results:c.results}).catch(()=>{});}}
+      return true;
+    }catch(e){if(Date.now()-lastOk>15000)setLive("err","Sin conexión");return false;}
+  }
+  function stream(){
+    try{
+      if(es)es.close();
+      es=new EventSource(BASE+"/sse");
+      es.onmessage=e=>{try{if(ingest(JSON.parse(e.data)))rebuild()}catch(x){}lastOk=Date.now();setLive("on","En directo")};
+      es.onopen=()=>{lastOk=Date.now();setLive("on","En directo")};
+    }catch(e){}
+  }
+  const c=load();if(c){if(Array.isArray(c.names)&&c.names.length===8)state.names=c.names;state.results=c.results||{};render();}
+  history().then(()=>{state.ready=true;render();});
+  stream();
+  setInterval(history,15000);
+  document.addEventListener("visibilitychange",()=>{if(!document.hidden){history();stream();}});
+  const link=location.origin+location.pathname;
+  const wa="https://wa.me/?text="+encodeURIComponent("Americana de pádel 🎾 Resultados y clasificación aquí: "+link);
+  $("#notice").innerHTML=`<div class="notice" style="display:flex;gap:10px;align-items:center;justify-content:space-between"><span><strong>Comparte el enlace</strong><br>Todos ven y apuntan los mismos resultados.</span><a class="btn primary" style="flex:0 0 auto;padding:0 16px;text-decoration:none" href="${wa}" target="_blank" rel="noopener">WhatsApp</a></div>`;
+  return {
+    saveResult:(mid,val)=>publish({k:"r",id:mid,v:val}),
+    saveNames:names=>publish({k:"n",names})
   };
 }
 
 /* ---------- boot ---------- */
 render();
-const tParam=new URLSearchParams(location.search).get("t");
-if(tParam){backend=blobBackend(tParam);}
-else if(window.claude&&typeof window.claude.use==="function"){
+const TOPIC="americana-padel-xs9-dcf161540d277354";
+if(window.claude&&typeof window.claude.use==="function"){
   setLive("","Conectando…");
   window.claude.use("db").then(async db=>{
     if(!db){state.readOnly=true;render();setLive("err","Sin datos compartidos");$("#notice").innerHTML=`<div class="notice"><strong>No se pueden cargar los resultados compartidos.</strong> Inicia sesión para ver el torneo en directo.</div>`;return;}
     backend=await claudeBackend(db);
     try{const u=await window.claude.use("user");if(u&&typeof u.can==="function"){const c=await u.can("data.write");if(c===false){state.readOnly=true;render();}}}catch(e){}
   });
-} else { setLive("","Sin torneo"); state.readOnly=true; render(); setupScreen(); }
+} else { backend=ntfyBackend(TOPIC); }
 })();
 </script>
 </body>
